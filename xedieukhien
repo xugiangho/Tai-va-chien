@@ -1,0 +1,284 @@
+#define CUSTOM_SETTINGS
+#define INCLUDE_GAMEPAD_MODULE
+#include <DabbleESP32.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+// Right motor pins
+int enableRightMotor = 22; 
+int rightMotorPin1 = 16;
+int rightMotorPin2 = 17;
+
+// Left motor pins
+int enableLeftMotor = 23;
+int leftMotorPin1 = 18;
+int leftMotorPin2 = 19;
+
+#define MAX_MOTOR_SPEED 255
+
+// PWM settings
+const int PWMFreq = 1000; /* 1 KHz */  
+const int PWMResolution = 8;
+const int rightMotorPWMSpeedChannel = 4;
+const int leftMotorPWMSpeedChannel = 5;
+
+// FreeRTOS structures
+typedef struct {
+  int rightSpeed;
+  int leftSpeed;
+} MotorCommand_t;
+
+// Queue và Semaphore
+QueueHandle_t commandQueue;
+QueueHandle_t motorQueue;
+SemaphoreHandle_t motorMutex;
+
+// Task handles
+TaskHandle_t bluetoothTaskHandle;
+TaskHandle_t commandProcessTaskHandle;
+TaskHandle_t motorControlTaskHandle;
+
+// Command structure
+typedef enum {
+  CMD_STOP = 0,
+  CMD_FORWARD,
+  CMD_BACKWARD,
+  CMD_LEFT,
+  CMD_RIGHT
+} Command_t;
+
+// Bluetooth Task - Nhận dữ liệu từ Bluetooth
+void bluetoothTask(void *parameter) {
+  Command_t command;
+  
+  while (1) {
+    // Xử lý dữ liệu Bluetooth
+    Dabble.processInput();
+    
+    // Đọc lệnh từ gamepad
+    if (GamePad.isUpPressed()) {
+      command = CMD_FORWARD;
+    }
+    else if (GamePad.isDownPressed()) {
+      command = CMD_BACKWARD;
+    }
+    else if (GamePad.isLeftPressed()) {
+      command = CMD_LEFT;
+    }
+    else if (GamePad.isRightPressed()) {
+      command = CMD_RIGHT;
+    }
+    else {
+      command = CMD_STOP;
+    }
+    
+    // Gửi lệnh vào queue
+    if (xQueueSend(commandQueue, &command, pdMS_TO_TICKS(10)) != pdTRUE) {
+      Serial.println("Failed to send command to queue");
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(50)); // Delay 50ms
+  }
+}
+
+// Command Processing Task - Xử lý lệnh điều khiển
+void commandProcessTask(void *parameter) {
+  Command_t receivedCommand;
+  MotorCommand_t motorCmd;
+  
+  while (1) {
+    // Nhận lệnh từ queue
+    if (xQueueReceive(commandQueue, &receivedCommand, portMAX_DELAY) == pdTRUE) {
+      
+      // Xử lý lệnh và chuyển đổi thành tín hiệu motor
+      switch (receivedCommand) {
+        case CMD_FORWARD:
+          motorCmd.rightSpeed = MAX_MOTOR_SPEED;
+          motorCmd.leftSpeed = MAX_MOTOR_SPEED;
+          Serial.println("Command: FORWARD");
+          break;
+          
+        case CMD_BACKWARD:
+          motorCmd.rightSpeed = -MAX_MOTOR_SPEED;
+          motorCmd.leftSpeed = -MAX_MOTOR_SPEED;
+          Serial.println("Command: BACKWARD");
+          break;
+          
+        case CMD_LEFT:
+          motorCmd.rightSpeed = MAX_MOTOR_SPEED;
+          motorCmd.leftSpeed = -MAX_MOTOR_SPEED;
+          Serial.println("Command: LEFT");
+          break;
+          
+        case CMD_RIGHT:
+          motorCmd.rightSpeed = -MAX_MOTOR_SPEED;
+          motorCmd.leftSpeed = MAX_MOTOR_SPEED;
+          Serial.println("Command: RIGHT");
+          break;
+case CMD_STOP:
+        default:
+          motorCmd.rightSpeed = 0;
+          motorCmd.leftSpeed = 0;
+          Serial.println("Command: STOP");
+          break;
+      }
+      
+      // Gửi lệnh motor vào queue
+      if (xQueueSend(motorQueue, &motorCmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        Serial.println("Failed to send motor command to queue");
+      }
+    }
+  }
+}
+
+// Motor Control Task - Điều khiển động cơ
+void motorControlTask(void *parameter) {
+  MotorCommand_t motorCmd;
+  
+  while (1) {
+    // Nhận lệnh motor từ queue
+    if (xQueueReceive(motorQueue, &motorCmd, portMAX_DELAY) == pdTRUE) {
+      
+      // Sử dụng mutex để bảo vệ việc truy cập motor
+      if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        
+        // Điều khiển motor
+        rotateMotor(motorCmd.rightSpeed, motorCmd.leftSpeed);
+        
+        Serial.printf("Motor speeds - Right: %d, Left: %d\n", 
+                     motorCmd.rightSpeed, motorCmd.leftSpeed);
+        
+        // Trả lại mutex
+        xSemaphoreGive(motorMutex);
+      }
+    }
+  }
+}
+
+void rotateMotor(int rightMotorSpeed, int leftMotorSpeed) {
+  // Right motor control
+  if (rightMotorSpeed < 0) {
+    digitalWrite(rightMotorPin1, LOW);
+    digitalWrite(rightMotorPin2, HIGH);    
+  }
+  else if (rightMotorSpeed > 0) {
+    digitalWrite(rightMotorPin1, HIGH);
+    digitalWrite(rightMotorPin2, LOW);      
+  }
+  else {
+    digitalWrite(rightMotorPin1, LOW);
+    digitalWrite(rightMotorPin2, LOW);      
+  }
+  
+  // Left motor control
+  if (leftMotorSpeed < 0) {
+    digitalWrite(leftMotorPin1, LOW);
+    digitalWrite(leftMotorPin2, HIGH);    
+  }
+  else if (leftMotorSpeed > 0) {
+    digitalWrite(leftMotorPin1, HIGH);
+    digitalWrite(leftMotorPin2, LOW);      
+  }
+  else {
+    digitalWrite(leftMotorPin1, LOW);
+    digitalWrite(leftMotorPin2, LOW);      
+  }
+  
+  // Set PWM speed
+  ledcWrite(rightMotorPWMSpeedChannel, abs(rightMotorSpeed));
+  ledcWrite(leftMotorPWMSpeedChannel, abs(leftMotorSpeed));  
+}
+
+void setUpPinModes() {
+  // Motor pin setup
+  pinMode(enableRightMotor, OUTPUT);
+  pinMode(rightMotorPin1, OUTPUT);
+  pinMode(rightMotorPin2, OUTPUT);
+  
+  pinMode(enableLeftMotor, OUTPUT);
+  pinMode(leftMotorPin1, OUTPUT);
+  pinMode(leftMotorPin2, OUTPUT);
+
+  // PWM setup
+  ledcSetup(rightMotorPWMSpeedChannel, PWMFreq, PWMResolution);
+  ledcSetup(leftMotorPWMSpeedChannel, PWMFreq, PWMResolution);  
+  ledcAttachPin(enableRightMotor, rightMotorPWMSpeedChannel);
+  ledcAttachPin(enableLeftMotor, leftMotorPWMSpeedChannel); 
+
+  // Initialize motors to stop
+  rotateMotor(0, 0); 
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Setup hardware
+  setUpPinModes();
+  
+  // Initialize Bluetooth
+  Dabble.begin("MyBluetoothCar"); 
+  
+  Serial.println("Setting up FreeRTOS...");
+  
+  // Create queues
+  commandQueue = xQueueCreate(10, sizeof(Command_t));
+  motorQueue = xQueueCreate(5, sizeof(MotorCommand_t));
+  
+  // Create mutex
+  motorMutex = xSemaphoreCreateMutex();
+// Check if queues and mutex created successfully
+  if (commandQueue == NULL || motorQueue == NULL || motorMutex == NULL) {
+    Serial.println("Failed to create queues or mutex!");
+    while(1); // Halt system
+  }
+  
+  // Create tasks
+  xTaskCreatePinnedToCore(
+    bluetoothTask,           // Task function
+    "Bluetooth Task",        // Task name
+    4096,                    // Stack size
+    NULL,                    // Parameters
+    2,                       // Priority
+    &bluetoothTaskHandle,    // Task handle
+    0                        // Core (0 or 1)
+  );
+  
+  xTaskCreatePinnedToCore(
+    commandProcessTask,      // Task function
+    "Command Process",       // Task name
+    4096,                    // Stack size
+    NULL,                    // Parameters
+    2,                       // Priority
+    &commandProcessTaskHandle, // Task handle
+    0                        // Core
+  );
+  
+  xTaskCreatePinnedToCore(
+    motorControlTask,        // Task function
+    "Motor Control",         // Task name
+    4096,                    // Stack size
+    NULL,                    // Parameters
+    3,                       // Priority (highest)
+    &motorControlTaskHandle, // Task handle
+    1                        // Core
+  );
+  
+  Serial.println("FreeRTOS tasks created successfully!");
+}
+
+void loop() {
+  // FreeRTOS scheduler đã chạy, loop() không cần làm gì
+  // Có thể thêm monitoring code ở đây
+  
+  // In thông tin hệ thống mỗi 5 giây
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 5000) {
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Tasks running: %d\n", uxTaskGetNumberOfTasks());
+    lastPrint = millis();
+  }
+  
+  vTaskDelay(pdMS_TO_TICKS(1000)); // Delay 1 second
+}
